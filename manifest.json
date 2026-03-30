@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "IndiaMart BuyLead Auto-Picker",
+  "version": "1.0.0",
+  "description": "Watches BuyLeads on IndiaMart and auto-accepts leads matching your keywords.",
+  "permissions": [
+    "storage",
+    "notifications"
+  ],
+  "host_permissions": [
+    "https://seller.indiamart.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://seller.indiamart.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon.png",
+      "48": "icon.png",
+      "128": "icon.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icon.png",
+    "48": "icon.png",
+    "128": "icon.png"
+  }
+}

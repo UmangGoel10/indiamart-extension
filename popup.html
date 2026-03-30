@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>BuyLead Auto-Picker</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 320px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #f8f9fa;
+      color: #212529;
+    }
+
+    .header {
+      background: linear-gradient(135deg, #1a6b3a, #28a745);
+      color: white;
+      padding: 16px 18px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .header-logo { font-size: 22px; }
+    .header-text h1 { font-size: 14px; font-weight: 700; letter-spacing: 0.3px; }
+    .header-text p  { font-size: 11px; opacity: 0.85; margin-top: 2px; }
+
+    .body { padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
+
+    /* Card wrapper */
+    .card {
+      background: white;
+      border-radius: 10px;
+      padding: 12px 14px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+    }
+
+    /* Toggle row */
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .toggle-label    { font-size: 13px; font-weight: 600; }
+    .toggle-sublabel { font-size: 11px; color: #6c757d; margin-top: 2px; }
+
+    .switch { position: relative; width: 44px; height: 24px; flex-shrink: 0; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute; inset: 0;
+      background: #ced4da; border-radius: 24px;
+      cursor: pointer; transition: background 0.2s;
+    }
+    .slider::before {
+      content: ''; position: absolute;
+      width: 18px; height: 18px;
+      left: 3px; top: 3px;
+      background: white; border-radius: 50%;
+      transition: transform 0.2s;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+    }
+    input:checked + .slider { background: #28a745; }
+    input:checked + .slider::before { transform: translateX(20px); }
+
+    /* Lead limit section */
+    .section-title {
+      font-size: 11px; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.5px;
+      color: #6c757d; margin-bottom: 8px;
+    }
+
+    /* Limit input + counter row */
+    .limit-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .limit-row input[type="number"] {
+      width: 80px;
+      padding: 7px 10px;
+      border: 1.5px solid #dee2e6;
+      border-radius: 7px;
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .limit-row input[type="number"]:focus { border-color: #28a745; }
+    .limit-hint { font-size: 11px; color: #6c757d; }
+
+    /* Progress bar */
+    .progress-wrap {
+      margin-top: 10px;
+    }
+    .progress-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 11px;
+      color: #495057;
+      margin-bottom: 5px;
+    }
+    .progress-bar-bg {
+      height: 8px;
+      background: #e9ecef;
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      background: #28a745;
+      border-radius: 10px;
+      transition: width 0.4s ease;
+      min-width: 0%;
+    }
+    .progress-bar-fill.warning { background: #fd7e14; }
+    .progress-bar-fill.danger  { background: #dc3545; }
+
+    .reset-btn {
+      margin-top: 8px;
+      font-size: 11px;
+      color: #6c757d;
+      background: none;
+      border: 1px solid #dee2e6;
+      border-radius: 6px;
+      padding: 4px 10px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .reset-btn:hover { background: #f8f9fa; color: #dc3545; border-color: #dc3545; }
+
+    /* Keywords section */
+    .keyword-input-row { display: flex; gap: 6px; margin-bottom: 10px; }
+    .keyword-input-row input {
+      flex: 1; padding: 8px 10px;
+      border: 1.5px solid #dee2e6; border-radius: 7px;
+      font-size: 13px; outline: none; transition: border-color 0.15s;
+    }
+    .keyword-input-row input:focus { border-color: #28a745; }
+
+    .btn-add {
+      background: #28a745; color: white; border: none;
+      border-radius: 7px; padding: 8px 12px;
+      font-size: 18px; font-weight: 600;
+      cursor: pointer; line-height: 1; transition: background 0.15s;
+    }
+    .btn-add:hover { background: #218838; }
+
+    .keyword-list {
+      display: flex; flex-wrap: wrap; gap: 6px;
+      min-height: 32px; background: #f8f9fa;
+      border-radius: 8px; padding: 8px;
+      border: 1.5px solid #dee2e6;
+    }
+    .keyword-tag {
+      display: flex; align-items: center; gap: 5px;
+      background: #e8f5e9; color: #1a6b3a;
+      border-radius: 20px; padding: 3px 10px;
+      font-size: 12px; font-weight: 500;
+    }
+    .keyword-tag .remove { cursor: pointer; font-size: 14px; color: #6c757d; line-height: 1; }
+    .keyword-tag .remove:hover { color: #dc3545; }
+    .empty-msg { font-size: 12px; color: #adb5bd; align-self: center; }
+
+    /* Status bar */
+    .status-bar {
+      display: flex; align-items: center; gap: 8px;
+      font-size: 12px; color: #495057;
+    }
+    .status-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #ced4da; flex-shrink: 0;
+    }
+    .status-dot.active { background: #28a745; animation: pulse 1.5s infinite; }
+    .status-dot.stopped { background: #dc3545; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; } 50% { opacity: 0.4; }
+    }
+
+    /* Limit-reached banner */
+    .limit-banner {
+      display: none;
+      background: #fff3cd; border: 1px solid #ffc107;
+      border-radius: 8px; padding: 8px 12px;
+      font-size: 12px; color: #856404;
+      text-align: center;
+    }
+    .limit-banner.show { display: block; }
+
+    .footer {
+      padding: 6px 16px 12px;
+      font-size: 10px; color: #adb5bd; text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-logo">🤖</div>
+  <div class="header-text">
+    <h1>BuyLead Auto-Picker</h1>
+    <p>IndiaMart keyword-based auto-accept</p>
+  </div>
+</div>
+
+<div class="body">
+
+  <!-- Toggle -->
+  <div class="card">
+    <div class="toggle-row">
+      <div>
+        <div class="toggle-label">Auto-Accept Mode</div>
+        <div class="toggle-sublabel">Watches for new leads in real-time</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="enableToggle" />
+        <span class="slider"></span>
+      </label>
+    </div>
+  </div>
+
+  <!-- Lead Limit -->
+  <div class="card">
+    <div class="section-title">🎯 Lead Limit</div>
+    <div class="limit-row">
+      <input type="number" id="leadLimitInput" min="0" max="9999" placeholder="e.g. 10" />
+      <span class="limit-hint">leads max &nbsp;(0 = unlimited)</span>
+    </div>
+
+    <div class="progress-wrap">
+      <div class="progress-label">
+        <span>Picked this session</span>
+        <span id="countLabel">0 / ∞</span>
+      </div>
+      <div class="progress-bar-bg">
+        <div class="progress-bar-fill" id="progressFill" style="width:0%"></div>
+      </div>
+      <button class="reset-btn" id="resetBtn">↺ Reset counter</button>
+    </div>
+  </div>
+
+  <!-- Limit reached banner -->
+  <div class="limit-banner" id="limitBanner">
+    🏁 Lead limit reached — auto-accept paused.
+  </div>
+
+  <!-- Keywords -->
+  <div class="card">
+    <div class="section-title">🔑 Keywords to Watch</div>
+    <div class="keyword-input-row">
+      <input type="text" id="keywordInput" placeholder='e.g. "ceftriaxone"' />
+      <button class="btn-add" id="addBtn" title="Add keyword">+</button>
+    </div>
+    <div class="keyword-list" id="keywordList">
+      <span class="empty-msg" id="emptyMsg">No keywords added yet</span>
+    </div>
+  </div>
+
+  <!-- Status -->
+  <div class="card status-bar">
+    <div class="status-dot" id="statusDot"></div>
+    <span id="statusText">Loading...</span>
+  </div>
+
+</div>
+
+<div class="footer">Works on seller.indiamart.com · All processing is local</div>
+
+<script src="popup.js"></script>
+</body>
+</html>
