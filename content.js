@@ -1,36 +1,56 @@
 // ============================================================
-// IndiaMart BuyLead Auto-Picker — content.js (SPEED v4)
+// IndiaMart BuyLead Auto-Picker — content.js (FINAL)
 // Page: seller.indiamart.com/messagecentre/buyleads/
 // ============================================================
+// TIMING PHILOSOPHY:
+//   Your code owns ~5ms of the cycle. The rest is IndiaMart's
+//   feed refresh (200–600ms). Every design decision here
+//   optimises for firing the click signal first, not confirming
+//   it arrived. Fire-and-trust beats wait-and-verify in a race.
+// ============================================================
 
-let keywords = [];
-let isEnabled = false;
-let leadLimit = 0;
-let pickedCount = 0;
-
+// ── State ────────────────────────────────────────────────
+let keywords        = [];
+let isEnabled       = false;
+let leadLimit       = 0;
+let pickedCount     = 0;
 let compiledKeywords = [];
-let scanInterval = null;
-let lastTopCardId = null; // Track the current top card so we don't spam clicks on the same one
-let isProcessingCard = false;
-let settingsReady = false;
-let settingsLoadSeq = 0;
-let settingsReloadTimer = null;
-let cachedCardSelector = null;
-let lastHandledUrl = location.href;
 
+let scanInterval    = null;
+let lastTopCardId   = null;   // fingerprint of card currently being handled
+let isProcessingCard = false; // tracks active async process for current top card
+let settingsReady   = false;
+let settingsLoadSeq = 0;      // stale-callback guard for overlapping loadSettings calls
+let lastHandledUrl  = location.href;
+let scannerState    = 'IDLE'; // IDLE | SHIMMER_BLOCKED | READY | PROCESSING
+let lastShimmerSeenAt = 0;
+let activeProcess   = null;   // { token, fingerprint, cancelled }
+let processSeq      = 0;
+let scanTickCount   = 0;
+let lastHeartbeatAt = 0;
+let shimmerWasVisible = false;
+let settleWaitLogged = false;
+let shimmerBlockStartedAt = 0;
+let shimmerBlockConsecutive = 0;
+let ignoreShimmerUntil = 0;
+let lastSameTopLeadLogAt = 0;
+const recentlyClickedLeads = new Map(); // key -> timestamp(ms)
+let lastClickAt = 0;
+
+// ── Constants ────────────────────────────────────────────
 const CONTACT_BUYER_RX = /contact\s*buyer/i;
-const POLL_INTERVAL_MS = 100; // Aggressive while-loop equivalent
+const POLL_MS          = 100; // how often the scanner tick runs
+const SHIMMER_SETTLE_MS = 200;
+const SHIMMER_MAX_BLOCK_MS = 4000;
+const SHIMMER_FORCE_RESUME_STREAK = 25;
+const SHIMMER_BYPASS_AFTER_FORCE_MS = 1500;
+const CLICK_DEDUPE_TTL_MS = 3000;
+const CLICK_COOLDOWN_MS = 350;
+const SAME_TOP_LEAD_LOG_MS = 1000;
+const DEBUG            = true;
+const HEARTBEAT_MS     = 3000;
 
-function escapeRegExp(v) {
-  if (typeof v !== 'string') return '';
-  return v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function normalizeText(v) {
-  return (v || '').replace(/\s+/g, ' ').trim().toLowerCase();
-}
-
-// ── Card & feed selectors ────────────────────────────────
+// ── Card selectors (tried in order, first match wins) ────
 const CARD_SELECTORS = [
   '[class*="lstNw"]',
   'div.f1.lstNw',
@@ -38,37 +58,182 @@ const CARD_SELECTORS = [
   '[class*="Prd_Enq"]',
   '[class*="bl-listing"]'
 ];
-const CARD_SELECTOR_STR = CARD_SELECTORS.join(',');
 
-// ── Load settings ────────────────────────────────────────
+// ── Feed container selector (narrows button proximity search) ─
+const FEED_SELECTORS = [
+  '#list1',
+  'div.bl_grid',
+  '[class*="bl_listing"]',
+  '#buyleads-container',
+  '.messagecentre-right',
+  'main',
+  'section'
+];
+
+// ── Helpers ──────────────────────────────────────────────
+function escapeRegExp(v) {
+  if (typeof v !== 'string') return '';
+  return v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeText(v) {
+  if (v === null || v === undefined) return '';
+  return String(v).replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function debugStamp() {
+  return new Date().toISOString().split('T')[1].replace('Z', '');
+}
+
+function logInfo(msg, meta) {
+  if (!DEBUG) return;
+  if (meta !== undefined) console.log(`[BuyLead][${debugStamp()}] ${msg}`, meta);
+  else console.log(`[BuyLead][${debugStamp()}] ${msg}`);
+}
+
+function logWarn(msg, meta) {
+  if (meta !== undefined) console.warn(`[BuyLead][${debugStamp()}] ${msg}`, meta);
+  else console.warn(`[BuyLead][${debugStamp()}] ${msg}`);
+}
+
+function logDebug(msg, meta) {
+  if (!DEBUG) return;
+  if (meta !== undefined) console.debug(`[BuyLead][${debugStamp()}] ${msg}`, meta);
+  else console.debug(`[BuyLead][${debugStamp()}] ${msg}`);
+}
+
+function scannerSnapshot() {
+  return {
+    state: scannerState,
+    enabled: isEnabled,
+    settingsReady,
+    processing: isProcessingCard,
+    hasActiveProcess: !!activeProcess,
+    dedupeCacheSize: recentlyClickedLeads.size,
+    pickedCount,
+    leadLimit,
+    tick: scanTickCount
+  };
+}
+
+function pruneRecentlyClicked(now = Date.now()) {
+  for (const [k, ts] of recentlyClickedLeads.entries()) {
+    if (now - ts > CLICK_DEDUPE_TTL_MS) recentlyClickedLeads.delete(k);
+  }
+}
+
+function getCardStructureKey(card) {
+  const id = card.getAttribute('data-id') || card.getAttribute('data-lead-id') || card.id || '';
+  const href = card.querySelector('a[href]')?.getAttribute('href') || '';
+  const gridId = card.closest('[id^="list"]')?.id || '';
+  const cardIndex = card.parentElement
+    ? Array.prototype.indexOf.call(card.parentElement.children, card)
+    : -1;
+  return `${normalizeText(id)}|${normalizeText(href)}|${normalizeText(gridId)}|${cardIndex}`;
+}
+
+function getLeadKey(card) {
+  const ofrId = card.querySelector('input[name="ofrid"]')?.value || card.getAttribute('data-id') || card.getAttribute('data-lead-id') || '';
+  const offerDate = card.querySelector('input[name="offerdate"]')?.value || card.querySelector('input[name="ofrdate"]')?.value || '';
+  const mcatId = card.querySelector('input[name="mcatid"]')?.value || card.querySelector('input[name="mcatidnew"]')?.value || '';
+  const gridParam = card.querySelector('input[name="gridParam1"]')?.value || card.querySelector('input[id^="gridParam"]')?.value || '';
+  const cityId = card.querySelector('input[id^="city_id_"]')?.value || '';
+  const city = card.querySelector('input[id^="card_city_"]')?.value || '';
+  const state = card.querySelector('input[id^="card_state_"]')?.value || '';
+  const country = card.querySelector('input[id^="card_country_"]')?.value || '';
+  const buyerId = card.querySelector('input[id^="prime_mcat_id_"]')?.value || '';
+  const cat = card.querySelector('input[name="mcatname"]')?.value || card.querySelector('input[name="parent_mcatname"]')?.value || '';
+  const productOrService = card.querySelector('input[id^="productOrService"]')?.value || '';
+  const href = card.querySelector('a[href]')?.getAttribute('href') || '';
+
+  // Prefer explicit lead id when available so same-title inquiries are treated independently.
+  if (normalizeText(ofrId)) return `leadid:${normalizeText(ofrId)}`;
+
+  // Fallback avoids title-only identity; combines multiple metadata fields.
+  const parts = [
+    normalizeText(offerDate),
+    normalizeText(mcatId),
+    normalizeText(gridParam),
+    normalizeText(cityId),
+    normalizeText(city),
+    normalizeText(state),
+    normalizeText(country),
+    normalizeText(buyerId),
+    normalizeText(cat),
+    normalizeText(productOrService),
+    normalizeText(href)
+  ];
+
+  const nonEmpty = parts.filter(Boolean).length;
+  if (nonEmpty < 3) {
+    const structural = getCardStructureKey(card);
+    logWarn('Weak fallback dedupe key detected. Using structural fallback.', { nonEmpty, structural });
+    return `fallback:${parts.join('|')}|${structural}`;
+  }
+
+  return `fallback:${parts.join('|')}`;
+}
+
+function wasRecentlyClicked(leadKey, now = Date.now()) {
+  const ts = recentlyClickedLeads.get(leadKey);
+  return !!(ts && (now - ts) <= CLICK_DEDUPE_TTL_MS);
+}
+
+function markLeadClicked(leadKey, now = Date.now()) {
+  recentlyClickedLeads.set(leadKey, now);
+}
+
+function globalClickCoolingDown(now = Date.now()) {
+  return (now - lastClickAt) < CLICK_COOLDOWN_MS;
+}
+
+function sendMessageWithResponse(msg) {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage(msg, (res) => {
+        if (chrome.runtime.lastError) { resolve(null); return; }
+        resolve(res || null);
+      });
+    } catch (_) {
+      resolve(null);
+    }
+  });
+}
+
+// ── Settings ─────────────────────────────────────────────
 function loadSettings(cb) {
   const seq = ++settingsLoadSeq;
   try {
     chrome.storage.sync.get(['keywords', 'enabled', 'leadLimit', 'pickedCount'], (d) => {
-      if (seq !== settingsLoadSeq) {
-        if (cb) cb(false);
-        return;
-      }
+      // Discard if a newer load has already started
+      if (seq !== settingsLoadSeq) { if (cb) cb(false); return; }
       if (chrome.runtime.lastError) {
         console.warn('[BuyLead] Storage error:', chrome.runtime.lastError.message);
         if (cb) cb(false);
         return;
       }
-      keywords = Array.isArray(d.keywords) ? d.keywords : [];
-      isEnabled = d.enabled === true;
-      leadLimit = parseInt(d.leadLimit, 10) || 0;
-      pickedCount = parseInt(d.pickedCount, 10) || 0;
+      keywords     = Array.isArray(d.keywords) ? d.keywords : [];
+      isEnabled    = d.enabled === true;
+      leadLimit    = parseInt(d.leadLimit, 10)  || 0;
+      pickedCount  = parseInt(d.pickedCount, 10) || 0;
       compiledKeywords = keywords
         .map(kw => (typeof kw === 'string' ? kw : '').trim())
-        .filter(Boolean)
+        .filter(kw => kw.length > 0 && kw.length < 200) // cap length; long strings waste regex time
         .map(kw => new RegExp(escapeRegExp(kw), 'i'));
       settingsReady = true;
-
-      console.log(`[BuyLead] Settings loaded. Enabled: ${isEnabled}, Keywords: ${keywords.length}, Limit: ${leadLimit || '∞'}`);
+      logInfo('Settings loaded', {
+        enabled: isEnabled,
+        keywordCount: keywords.length,
+        leadLimit: leadLimit || '∞'
+      });
       if (cb) cb(true);
     });
   } catch (e) {
-    console.warn('[BuyLead] loadSettings failed:', e);
+    logWarn('loadSettings threw', e);
     if (cb) cb(false);
   }
 }
@@ -77,384 +242,688 @@ function limitReached() {
   return leadLimit > 0 && pickedCount >= leadLimit;
 }
 
+function isElementVisible(el) {
+  if (!el || !el.isConnected) return false;
+  try {
+    const s = getComputedStyle(el);
+    if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 2 && r.height > 2;
+  } catch (_) {
+    return false;
+  }
+}
+
+function getVisibleShimmerInfo(root = document) {
+  const scope = root || document;
+  const nodes = Array.from(scope.querySelectorAll('.secshimmer, .backgroundshimmer, [class*="shimmer"]'));
+  const visible = nodes.filter(isElementVisible);
+  return {
+    visibleCount: visible.length,
+    sampleClasses: visible.slice(0, 3).map((el) => el.className || '(no-class)')
+  };
+}
+
+function shouldBlockForShimmer() {
+  const feed = getFeedContainer();
+  const shimmerInfo = getVisibleShimmerInfo(feed);
+  if (shimmerInfo.visibleCount === 0) return { block: false, reason: 'no-visible-shimmer', shimmerInfo };
+
+  const cards = findLeadCards(feed);
+  if (cards.length > 0) {
+    const title = getLeadTitle(cards[0]);
+    if (title && title.length >= 4) {
+      return { block: false, reason: 'stable-top-card-present', shimmerInfo };
+    }
+
+    // If cards exist but title extraction is transiently incomplete, avoid hard blocking.
+    return { block: false, reason: 'cards-present-allow-scan', shimmerInfo };
+  }
+
+  return { block: true, reason: 'visible-shimmer-no-stable-card', shimmerInfo };
+}
+
+function cancelActiveProcess() {
+  if (activeProcess) {
+    logDebug('Cancelling active process', { token: activeProcess.token, fingerprint: activeProcess.fingerprint });
+    activeProcess.cancelled = true;
+  }
+}
+
+function isProcessCurrent(ctx) {
+  return !!(
+    ctx &&
+    activeProcess &&
+    activeProcess.token === ctx.token &&
+    activeProcess.fingerprint === ctx.fingerprint &&
+    !ctx.cancelled
+  );
+}
+
+// ── Count persistence ─────────────────────────────────────
+// Read-then-write avoids count drift when two tabs are open.
+async function incrementPicked() {
+  const res = await sendMessageWithResponse({ type: 'INCREMENT_COUNT' });
+  if (!res || res.ok !== true) {
+    logWarn('INCREMENT_COUNT failed; count not updated.', res);
+    return { ok: false, reached: limitReached() };
+  }
+
+  const nextCount = parseInt(res.pickedCount, 10);
+  const nextLimit = parseInt(res.leadLimit, 10);
+
+  if (!Number.isNaN(nextCount)) pickedCount = nextCount;
+  if (!Number.isNaN(nextLimit)) leadLimit = nextLimit;
+
+  safeSendMessage({ type: 'COUNT_UPDATED', pickedCount, leadLimit });
+  logInfo('Count incremented', { pickedCount, leadLimit: leadLimit || '∞', reached: res.reached === true });
+
+  if (res.reached === true) {
+    isEnabled = false;
+    stopScanner();
+    safeSendMessage({ type: 'LIMIT_REACHED', pickedCount });
+    logWarn(`Lead limit ${leadLimit} reached. Scanner disabled.`);
+  }
+
+  return { ok: true, reached: res.reached === true };
+}
+
+// ── Messaging ─────────────────────────────────────────────
 function safeSendMessage(msg, cb) {
   try {
-    chrome.runtime.sendMessage(msg, (response) => {
-      if (chrome.runtime.lastError) {
-        if (cb) cb(false);
-        return;
-      }
-      if (cb) cb(response || true);
+    chrome.runtime.sendMessage(msg, (res) => {
+      if (chrome.runtime.lastError) { if (cb) cb(false); return; }
+      if (cb) cb(res || true);
     });
   } catch (_) {
     if (cb) cb(false);
   }
 }
 
-function incrementPicked() {
-  pickedCount++;
-  const reached = limitReached();
-  if (reached) {
-    isEnabled = false;
-    stopScanner();
-  }
-
-  const update = reached ? { pickedCount, enabled: false } : { pickedCount };
-  chrome.storage.sync.set(update, () => {
-    safeSendMessage({ type: 'COUNT_UPDATED', pickedCount, leadLimit });
-    if (reached) {
-      safeSendMessage({ type: 'LIMIT_REACHED', pickedCount });
-      console.log(`[BuyLead] Limit ${leadLimit} reached. Disabled.`);
-    }
+function notifyMatch(title, clicked) {
+  safeSendMessage({
+    type:    'NOTIFY',
+    title:   clicked ? `✅ Accepted (${pickedCount}/${leadLimit || '∞'})` : '⚠️ Match — no button found',
+    message: title.substring(0, 100)
   });
 }
 
+// ── Keyword matching ──────────────────────────────────────
 function matchesKeywords(text) {
   if (!compiledKeywords.length) return false;
-  const match = compiledKeywords.find(rx => rx.test(text));
-  if (match) {
-    console.log(`[BuyLead] 🎯 Match found! Title: "${text}" matched keyword pattern: ${match}`);
+  const rx = compiledKeywords.find(r => r.test(text));
+  if (rx) {
+    logInfo('Keyword matched', { title: text, matchedRegex: String(rx) });
     return true;
   }
   return false;
 }
 
-// ── Extract lead title ───────────────────────────────────
+// ── Title extraction ──────────────────────────────────────
+// Primary: hidden input IndiaMart injects specifically for offer tracking.
+// Fallbacks cover layout variants and A/B tests.
 function getLeadTitle(card) {
-  // IndiaMart provides this hidden input precisely for tracking the offer title
-  const titleInput = card.querySelector('input[name="ofrtitle"]');
-  if (titleInput && titleInput.value) {
-    return titleInput.value.trim();
-  }
+  const inp = card.querySelector('input[name="ofrtitle"]');
+  if (inp?.value) return inp.value.trim();
 
-  // Fallbacks just in case
-  const sels = [
+  const fallbacks = [
     '.bl_lsting_title',
-    '[class*="Prd_Enq"] h2', '[class*="Prd_Enq"] h3',
+    '[class*="Prd_Enq"] h2',
+    '[class*="Prd_Enq"] h3',
     'h2', 'h3',
     '.prod-name', '.product-name',
     '.bl-prod-name', '.lead-title'
   ];
-  for (const s of sels) {
-    const el = card.querySelector(s);
+  for (const sel of fallbacks) {
+    const el = card.querySelector(sel);
     if (el) {
-      const t = (el.textContent || '').trim();
+      const t = el.textContent.trim();
       if (t.length > 3) return t;
     }
   }
-  const buys = card.querySelector('[class*="buy"], [class*="Buy"]');
-  if (buys) {
-    const t = (buys.textContent || '').trim();
+  // Last resort: first [class*="buy"] text that isn't just a button label
+  const buyEl = card.querySelector('[class*="buy"], [class*="Buy"]');
+  if (buyEl) {
+    const t = buyEl.textContent.trim();
     if (t.length > 3) return t;
   }
   return '';
 }
 
-// ── Click helpers ────────────────────────────────────────
+// ── Card fingerprint ──────────────────────────────────────
+// Uses only stable DOM attributes — NOT textContent.
+// textContent changes during micro-refreshes and causes false "new card" signals.
+function getCardFingerprint(card, title) {
+  const id =
+    card.querySelector('input[name="ofrid"]')?.value ||
+    card.getAttribute('data-id') ||
+    card.getAttribute('data-lead-id') ||
+    card.id ||
+    '';
+  const offerDate = card.querySelector('input[name="offerdate"]')?.value || card.querySelector('input[name="ofrdate"]')?.value || '';
+  const cityId = card.querySelector('input[id^="city_id_"]')?.value || '';
+  const city = card.querySelector('input[id^="card_city_"]')?.value || '';
+  const state = card.querySelector('input[id^="card_state_"]')?.value || '';
+  const country = card.querySelector('input[id^="card_country_"]')?.value || '';
+  const mcatId = card.querySelector('input[name="mcatid"]')?.value || card.querySelector('input[name="mcatidnew"]')?.value || '';
+  const gridParam = card.querySelector('input[name="gridParam1"]')?.value || card.querySelector('input[id^="gridParam"]')?.value || '';
+  const href = card.querySelector('a[href]')?.getAttribute('href') || '';
+  const cardIndex = card.parentElement
+    ? Array.prototype.indexOf.call(card.parentElement.children, card)
+    : -1;
+
+  // Prefer lead-specific metadata over title to distinguish similar inquiries.
+  if (normalizeText(id)) {
+    return `id:${normalizeText(id)}|${normalizeText(offerDate)}|${normalizeText(cityId)}|${normalizeText(mcatId)}`;
+  }
+
+  return [
+    normalizeText(offerDate),
+    normalizeText(gridParam),
+    normalizeText(cityId),
+    normalizeText(city),
+    normalizeText(state),
+    normalizeText(country),
+    normalizeText(mcatId),
+    normalizeText(href),
+    normalizeText(title),
+    cardIndex
+  ].join('|');
+}
+
+// ── Click helpers ─────────────────────────────────────────
+// No getBoundingClientRect — forces layout reflow, adds latency at 100ms polling.
 function isClickable(el) {
   if (!el?.isConnected || el.disabled) return false;
   try {
     const s = getComputedStyle(el);
-    if (s.display === 'none') return false;
-    if (s.visibility === 'hidden') return false;
+    if (s.display === 'none')       return false;
+    if (s.visibility === 'hidden')  return false;
     if (s.pointerEvents === 'none') return false;
-    if (parseFloat(s.opacity || '1') < 0.1) return false;
-    const rect = el.getBoundingClientRect();
-    const inViewport = rect.bottom > 0 && rect.top < window.innerHeight;
-    return inViewport;
-  } catch (_) {
-    return false; // detached or invalid node
-  }
-}
-
-function tryClick(el) {
-  if (!isClickable(el)) return false;
-  console.log(`[BuyLead] 🖱️ Attempting click on:`, el);
-  try {
-    // Fire multiple event styles since some UIs ignore plain .click().
-    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
-    el.click();
     return true;
-  } catch (e) {
-    console.warn('[BuyLead] Click dispatch failed:', e);
+  } catch (_) {
     return false;
   }
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+// Fire mousedown + mouseup + click to cover React/Vue synthetic event handlers.
+function tryClick(el) {
+  if (!isClickable(el)) return false;
+  try {
+    el.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true }));
+    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+    el.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, cancelable: true }));
+    el.dispatchEvent(new MouseEvent('mouseup',   { bubbles: true, cancelable: true }));
+    el.click();
+
+    // Some IndiaMart CTAs are divs with inline onclick handler and little/no text.
+    if (typeof el.onclick === 'function') {
+      el.onclick();
+    }
+
+    logInfo('Click fired', {
+      tag: el.tagName,
+      id: el.id || null,
+      className: el.className || null,
+      buttonText: (el.textContent || '').trim().substring(0, 40),
+      title: el.getAttribute('title') || null
+    });
+    return true;
+  } catch (e) {
+    logWarn('Click dispatch failed', e);
+    return false;
+  }
 }
 
-async function confirmClickApplied(card, btn, beforeTopId, beforeBtnText) {
-  const attempts = 6;
-  for (let i = 0; i < attempts; i++) {
-    await sleep(80);
+function isContactBuyerElement(el) {
+  if (!el) return false;
+  try {
+    const txt = normalizeText(el.textContent || '');
+    const titleText = normalizeText(el.getAttribute('title') || '');
+    const ariaLabel = normalizeText(el.getAttribute('aria-label') || '');
+    const onclickAttr = normalizeText(el.getAttribute('onclick') || '');
+    const className = normalizeText(el.className || '');
 
-    if (!card?.isConnected) return true;
-    if (!btn?.isConnected) return true;
-    if (btn.disabled) return true;
-
-    const currentBtnText = normalizeText(btn.textContent || '');
-    if (currentBtnText && currentBtnText !== normalizeText(beforeBtnText || '')) {
-      return true;
-    }
-    if (beforeBtnText && !CONTACT_BUYER_RX.test(btn.textContent || '')) {
-      return true;
-    }
-
-    const cards = findLeadCards();
-    if (!cards.length) continue;
-    const topCard = cards[0];
-    const currentTopId = getCardFingerprint(topCard, getLeadTitle(topCard));
-    if (beforeTopId && currentTopId !== beforeTopId) {
-      return true;
-    }
+    return (
+      CONTACT_BUYER_RX.test(txt) ||
+      CONTACT_BUYER_RX.test(titleText) ||
+      CONTACT_BUYER_RX.test(ariaLabel) ||
+      onclickAttr.includes('contactbuyernow') ||
+      className.includes('btncbn')
+    );
+  } catch (e) {
+    logWarn('Skipping candidate due to inspection error.', e);
+    return false;
   }
-
-  return false;
 }
 
-// ── Click "Contact Buyer Now" ────────────────────────────
-function findContactButton(card) {
-  // Local search first
-  for (const el of card.querySelectorAll('button, a, [class*="btn"], [class*="Btn"], .btnCBN')) {
-    const text = (el.textContent || '').trim();
-    if (CONTACT_BUYER_RX.test(text) && isClickable(el)) {
-      console.log(`[BuyLead] Found button by text: "${text}"`);
-      return el;
-    }
-  }
-  // Proximity fallback in feed
-  const cardTop = card.getBoundingClientRect().top;
-  const feed = getFeedContainer();
-  let best = null, bestDist = 600;
-  for (const btn of feed.querySelectorAll('button, a[class*="contact"], [class*="contactBtn"], [class*="contact_buyer"], .btnCBN')) {
-    const text = (btn.textContent || '').trim();
-    if (!CONTACT_BUYER_RX.test(text) || !isClickable(btn)) continue;
-    const d = Math.abs(btn.getBoundingClientRect().top - cardTop);
-    if (d < bestDist) { bestDist = d; best = btn; }
-  }
-  if (best) {
-    console.log(`[BuyLead] Found button by proximity (${Math.round(bestDist)}px)`);
-    return best;
-  }
-  return null;
-}
-
-async function clickAcceptButton(card, maxRetries = 3) {
-  const beforeTopId = getCardFingerprint(card, getLeadTitle(card));
-  for (let i = 0; i < maxRetries; i++) {
-    if (!card?.isConnected) return false;
-    const btn = findContactButton(card);
-    if (btn && tryClick(btn)) {
-      const confirmed = await confirmClickApplied(card, btn, beforeTopId, btn.textContent || '');
-      if (confirmed) return true;
-      console.warn('[BuyLead] Click fired but no UI confirmation detected. Retrying...');
-    }
-    if (i < maxRetries - 1) {
-      await sleep(120 * (i + 1));
-    }
-  }
-  console.warn('[BuyLead] Match found, but click was not confirmed.');
-  return false;
-}
-
+// ── Feed container ────────────────────────────────────────
 function getFeedContainer() {
-  for (const sel of ['#list1', 'div.bl_grid', '[class*="bl_listing"]', '#buyleads-container', '.messagecentre-right', 'main', 'section']) {
+  for (const sel of FEED_SELECTORS) {
     const el = document.querySelector(sel);
     if (el) return el;
   }
   return document.body;
 }
 
-function notifyMatch(title, clicked) {
-  safeSendMessage({
-    type: 'NOTIFY',
-    title: clicked ? `✅ Accepted (${pickedCount}/${leadLimit || '∞'})` : '⚠️ Match — no button',
-    message: title.substring(0, 100)
+// ── Button finder ─────────────────────────────────────────
+// 1. Search inside the card first (fast, safe, no wrong-card risk).
+// 2. Proximity fallback within the feed container only if step 1 fails.
+//    600px cap prevents matching a button from an unrelated card.
+function findContactButton(card) {
+  for (const el of card.querySelectorAll('button, a, [class*="btn"], [class*="Btn"], .btnCBN')) {
+    if (isContactBuyerElement(el) && isClickable(el)) {
+      logDebug('Button found inside card', {
+        text: (el.textContent || '').trim().substring(0, 40),
+        title: el.getAttribute('title') || null,
+        className: el.className || null
+      });
+      return el;
+    }
+  }
+
+  // Ranked fallback across multiple roots. Sticky/footer CTA is often outside card/feed subtree.
+  const feed = getFeedContainer();
+  const panel = card.closest('[class*="lstNw"], [class*="bl_listing"], .bl_grid, section, article');
+  const roots = [panel, feed, document.body].filter(Boolean);
+  const cardRect = card.getBoundingClientRect();
+  const seen = new Set();
+  const candidates = [];
+
+  const selector = [
+    'button',
+    'a',
+    '[role="button"]',
+    '[class*="btn"]',
+    '[class*="Btn"]',
+    '.btnCBN',
+    '[onclick]'
+  ].join(', ');
+
+  for (const root of roots) {
+    for (const el of root.querySelectorAll(selector)) {
+      if (seen.has(el)) continue;
+      seen.add(el);
+
+      if (!isContactBuyerElement(el)) continue;
+      if (!isClickable(el)) continue;
+
+      const r = el.getBoundingClientRect();
+      const dy = Math.abs(r.top - cardRect.top);
+      const dx = Math.abs(r.left - cardRect.left);
+
+      let score = dy + (dx * 0.25);
+      if (card.contains(el)) score -= 1000; // should have returned already, but keep as strongest safety
+      if (panel && panel.contains(el)) score -= 250;
+      if (r.top > cardRect.top) score -= 40; // usually CTA sits below title/details in same card/panel
+
+      candidates.push({
+        el,
+        score,
+        dy: Math.round(dy),
+        dx: Math.round(dx),
+        txt: (el.textContent || '').trim().substring(0, 60),
+        title: (el.getAttribute('title') || '').substring(0, 60),
+        className: (el.className || '').substring(0, 60)
+      });
+    }
+  }
+
+  candidates.sort((a, b) => a.score - b.score);
+  const best = candidates[0]?.el || null;
+  if (best) {
+    logDebug('Button found by ranked fallback', {
+      candidateCount: candidates.length,
+      top: candidates.slice(0, 3).map(c => ({
+        text: c.txt,
+        title: c.title,
+        className: c.className,
+        score: Math.round(c.score),
+        dy: c.dy,
+        dx: c.dx
+      }))
+    });
+    return best;
+  }
+
+  logWarn('No Contact Buyer candidate found in fallback roots.', {
+    rootsChecked: roots.length,
+    feedTag: feed?.tagName,
+    panelClass: panel?.className || null
   });
+  return null;
 }
 
-// ── Fingerprint for dedup ────────────────────────────────
-function getCardFingerprint(card, title) {
-  const href = card.querySelector('a[href]')?.getAttribute('href') || '';
-  const id = card.getAttribute('data-id') || card.getAttribute('data-lead-id') || card.id || '';
-  const summary = normalizeText(card.textContent || '').substring(0, 180);
-  return `${normalizeText(title)}|${href}|${id}|${summary}`;
+// ── Click with single render-wait fallback ────────────────
+// No confirmation loop. No multi-retry with growing sleeps.
+// Strategy: fire immediately. If button not found, wait ONE short
+// render frame (60ms) and try once more. That's it.
+// Rationale: if the button still isn't there after 60ms, the card
+// has no button (already claimed) — retrying for 360ms won't change that.
+async function clickAcceptButton(card, ctx, parentRef) {
+  if (!card?.isConnected || card.parentElement !== parentRef || !isProcessCurrent(ctx)) return false;
+
+  let btn = findContactButton(card);
+  if (!btn) {
+    await sleep(60); // single render-frame wait
+    if (!card?.isConnected || card.parentElement !== parentRef || !isProcessCurrent(ctx)) return false;
+    btn = findContactButton(card);
+  }
+
+  if (!btn) {
+    logWarn('No "Contact Buyer" button found on matched card.');
+    return false;
+  }
+
+  return tryClick(btn);
 }
 
-// ── Process one card (no delays) ─────────────────────────
-async function processCard(card) {
+// ── Process top card ──────────────────────────────────────
+async function processCard(card, ctx) {
   if (!isEnabled || !card || card.nodeType !== 1 || limitReached()) return false;
-  if (!card.isConnected) return false;
+  if (!card.isConnected || !isProcessCurrent(ctx)) return false;
+
+  const parentRef = card.parentElement;
+  if (!parentRef) return false;
 
   const title = getLeadTitle(card);
-  if (!title || title.length < 4) return false;
-
-  console.debug(`[BuyLead] Evaluating Top Lead: "${title}"`);
-
-  if (matchesKeywords(title)) {
-    if (!card.isConnected) {
-      console.warn('[BuyLead] Card detached before click attempt.');
-      return false;
-    }
-    const clicked = await clickAcceptButton(card);
-    if (clicked) {
-      incrementPicked();
-      // Reset immediately so scanner can re-evaluate top lead while feed catches up.
-      lastTopCardId = null;
-    }
-    notifyMatch(title, clicked);
-    return true; // Return true if we took action
+  if (!title || title.length < 4) {
+    logWarn('Card skipped — could not extract title.', { className: card.className });
+    return false;
   }
-  return false;
+
+  logDebug('Evaluating top card title', { title });
+
+  pruneRecentlyClicked();
+  const now = Date.now();
+  const leadKey = getLeadKey(card);
+  if (wasRecentlyClicked(leadKey)) {
+    logWarn('Skipping lead due to dedupe TTL (recently clicked).', { leadKey });
+    return false;
+  }
+
+  if (globalClickCoolingDown(now)) {
+    logDebug('Skipping lead due to global click cooldown.', { cooldownMs: CLICK_COOLDOWN_MS });
+    return false;
+  }
+
+  if (!matchesKeywords(title) || !isProcessCurrent(ctx)) return false;
+
+  if (!card.isConnected || card.parentElement !== parentRef || !isProcessCurrent(ctx)) {
+    logWarn('Card detached before click.');
+    return false;
+  }
+
+  const clicked = await clickAcceptButton(card, ctx, parentRef);
+
+  if (clicked) {
+    lastClickAt = Date.now();
+    markLeadClicked(leadKey, lastClickAt);
+    await incrementPicked();
+    // Keep lastTopCardId unchanged to avoid rapid re-click loops on the same top card.
+  }
+
+  notifyMatch(title, clicked);
+  return clicked;
 }
 
-// ── Continuous Polling Loop (The "While" loop) ───────────
-// We use setInterval instead of a "while(true)" loop because JavaScript is single-threaded.
-// A literal while loop would freeze the browser tab entirely and IndiaMart would never load.
+// ── Card discovery ────────────────────────────────────────
+function findLeadCards(root = document) {
+  const isValidCard = (el) => {
+    // Reject anything inside a shimmer/skeleton layer
+    if (el.closest('.secshimmer, .backgroundshimmer, [class*="shimmer"]')) return false;
+    // Accept if it has the canonical title input, a known title class, or enough text
+    return (
+      el.querySelector('input[name="ofrtitle"]') ||
+      el.querySelector('.prod-name, .bl_lsting_title') ||
+      normalizeText(el.textContent).length > 20
+    );
+  };
+
+  for (const sel of CARD_SELECTORS) {
+    const cards = Array.from(root.querySelectorAll(sel)).filter(isValidCard);
+    if (cards.length) return cards;
+  }
+  return [];
+}
+
+// ── Scanner ───────────────────────────────────────────────
 function startScanner() {
   if (!settingsReady) {
-    console.log('[BuyLead] Scanner start skipped: settings not ready.');
+    logWarn('Scanner start skipped: settings not ready.');
     return;
   }
   stopScanner();
-  const kwList = keywords.join(', ');
-  console.log(`[BuyLead] ⚡ Starting high-speed scanner. Checking top lead every ${POLL_INTERVAL_MS}ms for keywords: [${kwList}]`);
+  scannerState = 'READY';
+  lastShimmerSeenAt = 0;
+  scanTickCount = 0;
+  lastHeartbeatAt = 0;
+  shimmerWasVisible = false;
+  settleWaitLogged = false;
+  shimmerBlockStartedAt = 0;
+  shimmerBlockConsecutive = 0;
+  ignoreShimmerUntil = 0;
+  logInfo('Scanner started', {
+    pollMs: POLL_MS,
+    shimmerSettleMs: SHIMMER_SETTLE_MS,
+    shimmerMaxBlockMs: SHIMMER_MAX_BLOCK_MS,
+    keywords
+  });
 
   scanInterval = setInterval(() => {
-    if (!isEnabled || limitReached()) {
-      stopScanner();
+    scanTickCount += 1;
+
+    if (Date.now() - lastHeartbeatAt >= HEARTBEAT_MS) {
+      lastHeartbeatAt = Date.now();
+      logDebug('Scanner heartbeat', scannerSnapshot());
+    }
+
+    if (!isEnabled || limitReached()) { stopScanner(); return; }
+
+    // Skip while IndiaMart is mid-refresh (shimmer/skeleton visible).
+    // If we recently force-resumed, bypass shimmer checks briefly.
+    const bypassActive = Date.now() < ignoreShimmerUntil;
+    const shimmerCheck = bypassActive
+      ? { block: false, reason: 'bypass-active', shimmerInfo: { visibleCount: 0, sampleClasses: [] } }
+      : shouldBlockForShimmer();
+
+    if (shimmerCheck.block) {
+      if (!shimmerBlockStartedAt) shimmerBlockStartedAt = Date.now();
+      const blockedMs = Date.now() - shimmerBlockStartedAt;
+      shimmerBlockConsecutive += 1;
+
+      if (blockedMs >= SHIMMER_MAX_BLOCK_MS || shimmerBlockConsecutive >= SHIMMER_FORCE_RESUME_STREAK) {
+        logWarn('Shimmer block exceeded max window; forcing scanner resume.', {
+          blockedMs,
+          consecutiveBlocks: shimmerBlockConsecutive,
+          reason: shimmerCheck.reason,
+          shimmerInfo: shimmerCheck.shimmerInfo
+        });
+        shimmerWasVisible = false;
+        shimmerBlockStartedAt = 0;
+        shimmerBlockConsecutive = 0;
+        ignoreShimmerUntil = Date.now() + SHIMMER_BYPASS_AFTER_FORCE_MS;
+      } else {
+        if (!shimmerWasVisible) {
+          shimmerWasVisible = true;
+          logInfo('Shimmer detected — scanner temporarily blocked.', {
+            reason: shimmerCheck.reason,
+            shimmerInfo: shimmerCheck.shimmerInfo
+          });
+        }
+
+        scannerState = 'SHIMMER_BLOCKED';
+        lastShimmerSeenAt = Date.now();
+        lastTopCardId = null; // reset so the incoming card is evaluated fresh
+        settleWaitLogged = false;
+        cancelActiveProcess();
+        return;
+      }
+    } else {
+      shimmerBlockStartedAt = 0;
+      shimmerBlockConsecutive = 0;
+    }
+
+    if (shimmerWasVisible) {
+      shimmerWasVisible = false;
+      logInfo('Shimmer cleared — entering settle wait.', { settleMs: SHIMMER_SETTLE_MS });
+    }
+
+    // Wait a short settle window after shimmer clears to avoid partial DOM reads.
+    if (Date.now() - lastShimmerSeenAt < SHIMMER_SETTLE_MS) {
+      scannerState = 'SHIMMER_BLOCKED';
+      if (!settleWaitLogged) {
+        settleWaitLogged = true;
+        logDebug('Settle wait active after shimmer clear.');
+      }
       return;
     }
 
-    const isShimmering = document.querySelector('.secshimmer, .backgroundshimmer, [class*="shimmer"]');
-    if (isShimmering) {
-      if (lastTopCardId) {
-        console.log('[BuyLead] Page refresh/shimmer detected. Waiting for stable cards...');
-      }
-      lastTopCardId = null;
-      return;
+    if (settleWaitLogged) {
+      settleWaitLogged = false;
+      logDebug('Settle wait completed; scanner resumed.');
     }
 
     const cards = findLeadCards();
-    if (cards.length > 0) {
-      const topCard = cards[0];
-      const newTitle = getLeadTitle(topCard);
-      const currentId = getCardFingerprint(topCard, newTitle);
+    if (!cards.length) return;
 
-      if (currentId !== lastTopCardId && !isProcessingCard) {
-        lastTopCardId = currentId; // Mark this as our new target
-        console.log(`[BuyLead] 👀 New top lead detected: "${newTitle}"`);
-        isProcessingCard = true;
-        processCard(topCard).finally(() => {
-          isProcessingCard = false;
-        });
-      } else {
-        // Optional debug log: uncomment if you want to see the 100ms loop running
-        console.debug(`[BuyLead] ⏳ Still observing same top lead: "${newTitle}"`);
-      }
+    const topCard  = cards[0];
+    const title    = getLeadTitle(topCard);
+    const currentId = getCardFingerprint(topCard, title);
+
+    // If processing old top-card and the top changed, cancel stale process.
+    if (activeProcess && currentId !== activeProcess.fingerprint) {
+      cancelActiveProcess();
+      logDebug('Top card changed while processing; stale process cancelled.', {
+        previous: activeProcess?.fingerprint,
+        next: currentId
+      });
     }
-  }, POLL_INTERVAL_MS);
+
+    // Log once per second when the top lead is unchanged.
+    if (currentId === lastTopCardId) {
+      const nowMs = Date.now();
+      if (nowMs - lastSameTopLeadLogAt >= SAME_TOP_LEAD_LOG_MS) {
+        lastSameTopLeadLogAt = nowMs;
+        logDebug('Still same top lead', {
+          title,
+          fingerprint: currentId
+        });
+      }
+      return;
+    }
+
+    // Do not start a new process while one is already in flight.
+    if (isProcessingCard || activeProcess) return;
+
+    scannerState      = 'PROCESSING';
+    lastTopCardId    = currentId;
+    isProcessingCard = true;
+    activeProcess    = { token: ++processSeq, fingerprint: currentId, cancelled: false };
+    const processCtx = activeProcess;
+    logInfo('New top lead picked for processing', {
+      token: processCtx.token,
+      title,
+      fingerprint: currentId
+    });
+
+    processCard(topCard, processCtx).finally(() => {
+      if (activeProcess && activeProcess.token === processCtx.token) {
+        activeProcess = null;
+        isProcessingCard = false;
+        scannerState = 'READY';
+        logDebug('Process completed and scanner returned to READY.', { token: processCtx.token });
+      }
+    });
+  }, POLL_MS);
 }
 
 function stopScanner() {
   if (scanInterval) {
     clearInterval(scanInterval);
-    scanInterval = null;
-    lastTopCardId = null;
-    isProcessingCard = false;
+    scanInterval     = null;
   }
+  lastTopCardId    = null;
+  isProcessingCard = false;
+  activeProcess    = null;
+  scannerState     = 'IDLE';
+  shimmerBlockConsecutive = 0;
+  ignoreShimmerUntil = 0;
+  logInfo('Scanner stopped.', scannerSnapshot());
 }
 
-// ── Find cards & scan ────────────────────────────────────
-function findLeadCards(root = document) {
-  const isValidCard = (el) => {
-    if (el.closest('.secshimmer, .backgroundshimmer, [class*="shimmer"]')) return false;
-    return el.querySelector('input[name="ofrtitle"]') || el.querySelector('.prod-name, .bl_lsting_title') || normalizeText(el.textContent || '').length > 20;
-  };
-
-  if (cachedCardSelector) {
-    const cachedCards = Array.from(root.querySelectorAll(cachedCardSelector)).filter(isValidCard);
-    if (cachedCards.length) return cachedCards;
-    cachedCardSelector = null;
-  }
-
-  for (const sel of CARD_SELECTORS) {
-    const cards = Array.from(root.querySelectorAll(sel)).filter(isValidCard);
-    if (cards.length) {
-      cachedCardSelector = sel;
-      return cards;
-    }
-  }
-  return [];
-}
-
+// ── Settings reload (triggered by popup) ─────────────────
+// No debounce needed — SETTINGS_UPDATED is a deliberate user action, not a burst.
 function reloadSettingsAndScanner(cb) {
-  if (settingsReloadTimer) clearTimeout(settingsReloadTimer);
-  settingsReloadTimer = setTimeout(() => {
-    stopScanner();
-    loadSettings(() => {
-      if (isEnabled && !limitReached()) {
-        startScanner();
-      } else {
-        stopScanner();
-      }
-      if (cb) cb();
-    });
-  }, 120);
+  stopScanner();
+  loadSettings((ok) => {
+    if (ok && isEnabled && !limitReached()) startScanner();
+    if (cb) cb(ok);
+  });
 }
 
-// ── Message listener ─────────────────────────────────────
+// ── Message listener ──────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (!msg || !msg.type) return;
+  if (!msg?.type) return;
+
   if (msg.type === 'SETTINGS_UPDATED') {
-    reloadSettingsAndScanner(() => sendResponse({ ok: true }));
-    return true;
-  } else if (msg.type === 'GET_STATUS') {
+    logInfo('Received SETTINGS_UPDATED message. Reloading scanner settings.');
+    reloadSettingsAndScanner((ok) => sendResponse({ ok }));
+    return true; // keep channel open for async sendResponse
+  }
+
+  if (msg.type === 'GET_STATUS') {
     sendResponse({ enabled: isEnabled, keywords, pickedCount, leadLimit });
-  } else if (msg.type === 'RESET_COUNT') {
+    return;
+  }
+
+  if (msg.type === 'RESET_COUNT') {
     pickedCount = 0;
     chrome.storage.sync.set({ pickedCount: 0 });
+    logInfo('Received RESET_COUNT message. Counter reset to 0.');
     sendResponse({ ok: true });
   }
 });
 
-// ── Init ─────────────────────────────────────────────────
+// ── Init ──────────────────────────────────────────────────
 loadSettings(() => {
   if (isEnabled && !limitReached()) {
-    console.log('[BuyLead] 🚀 Bot is active and watching...');
+    logInfo('Init: extension is active and watching.');
     startScanner();
   } else {
-    console.log('[BuyLead] ⏸ Bot is disabled or limit reached. Update settings in popup to start.');
+    logInfo('Init: extension is disabled or lead limit already reached.');
   }
 });
 
-// SPA nav detection
+// ── SPA navigation detection ──────────────────────────────
+// Patch pushState + replaceState to catch framework-driven navigation.
+// popstate handles browser back/forward.
+// No polling fallback needed — the three listeners cover all cases.
 function handleNavigationChange() {
-  if (location.href !== lastHandledUrl) {
-    lastHandledUrl = location.href;
-    console.log('[BuyLead] 🔄 Navigation detected. Resetting scanner.');
-    stopScanner();
-    setTimeout(() => {
-      if (isEnabled && settingsReady && !limitReached()) startScanner();
-    }, 300);
-  }
+  if (location.href === lastHandledUrl) return;
+  const prevUrl = lastHandledUrl;
+  lastHandledUrl = location.href;
+  logInfo('Navigation detected — restarting scanner.', { from: prevUrl, to: lastHandledUrl });
+  cancelActiveProcess();
+  stopScanner();
+  // Brief wait for the new page's DOM to settle before scanning
+  setTimeout(() => {
+    if (isEnabled && settingsReady && !limitReached()) startScanner();
+  }, 300);
 }
 
 window.addEventListener('popstate', handleNavigationChange);
-const originalPushState = history.pushState;
-history.pushState = function patchedPushState(...args) {
-  const result = originalPushState.apply(this, args);
+
+const _origPush = history.pushState;
+history.pushState = function (...args) {
+  const r = _origPush.apply(this, args);
   handleNavigationChange();
-  return result;
-};
-const originalReplaceState = history.replaceState;
-history.replaceState = function patchedReplaceState(...args) {
-  const result = originalReplaceState.apply(this, args);
-  handleNavigationChange();
-  return result;
+  return r;
 };
 
-setInterval(handleNavigationChange, 300);
+const _origReplace = history.replaceState;
+history.replaceState = function (...args) {
+  const r = _origReplace.apply(this, args);
+  handleNavigationChange();
+  return r;
+};

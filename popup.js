@@ -17,6 +17,89 @@ let keywords    = [];
 let enabled     = false;
 let leadLimit   = 0;
 let pickedCount = 0;
+const DEBUG = true;
+
+function logPopup(msg, meta) {
+  if (!DEBUG) return;
+  if (meta !== undefined) console.log(`[BuyLead][POPUP] ${msg}`, meta);
+  else console.log(`[BuyLead][POPUP] ${msg}`);
+}
+
+function warnPopup(msg, meta) {
+  if (meta !== undefined) console.warn(`[BuyLead][POPUP] ${msg}`, meta);
+  else console.warn(`[BuyLead][POPUP] ${msg}`);
+}
+
+function normalizeErrorMessage(err) {
+  if (!err) return 'unknown-error';
+  if (typeof err === 'string') return err;
+  if (typeof err.message === 'string') return err.message;
+  try {
+    return JSON.stringify(err);
+  } catch (_) {
+    return String(err);
+  }
+}
+
+function isEligibleSellerTab(tab) {
+  const url = tab?.url || '';
+  return /^https:\/\/seller\.indiamart\.com\//i.test(url);
+}
+
+function isExpectedTransientSendError(msg) {
+  const m = (msg || '').toLowerCase();
+  return (
+    m.includes('receiving end does not exist') ||
+    m.includes('message port closed') ||
+    m.includes('could not establish connection')
+  );
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function pushSettingsUpdate(retries = 3, delayMs = 250) {
+  logPopup('Pushing SETTINGS_UPDATED to active tab.', { retries, delayMs });
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  const tab = tabs[0];
+
+  if (!tab?.id) {
+    logPopup('Skipping SETTINGS_UPDATED: no active tab id found.');
+    return false;
+  }
+
+  if (!isEligibleSellerTab(tab)) {
+    logPopup('Skipping SETTINGS_UPDATED: active tab is not seller.indiamart.com.', { url: tab.url || null });
+    return false;
+  }
+
+  const tabId = tab.id;
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await chrome.tabs.sendMessage(tabId, { type: 'SETTINGS_UPDATED' });
+      if (res?.ok) {
+        logPopup('SETTINGS_UPDATED acknowledged by content script.', { attempt, tabId });
+        return true;
+      }
+      warnPopup('SETTINGS_UPDATED did not return ok. Retrying if attempts remain.', { attempt, tabId, res });
+    } catch (err) {
+      const msg = normalizeErrorMessage(err);
+      const meta = { attempt, tabId, error: msg };
+      // These are expected while tab/content script is reloading; keep them as info.
+      if (isExpectedTransientSendError(msg)) {
+        logPopup('SETTINGS_UPDATED send deferred due to transient tab/content state.', meta);
+      } else {
+        warnPopup('SETTINGS_UPDATED send failed.', meta);
+      }
+    }
+
+    if (attempt < retries) await sleep(delayMs);
+  }
+  warnPopup('SETTINGS_UPDATED exhausted retries without acknowledgement.');
+  return false;
+}
 
 // ── Load from storage ─────────────────────────────────────────
 chrome.storage.sync.get(['keywords', 'enabled', 'leadLimit', 'pickedCount'], (data) => {
@@ -31,22 +114,31 @@ chrome.storage.sync.get(['keywords', 'enabled', 'leadLimit', 'pickedCount'], (da
   renderKeywords();
   updateProgress();
   updateStatus();
+  logPopup('Popup initialized from storage.', {
+    enabled,
+    keywordCount: keywords.length,
+    leadLimit: leadLimit || '∞',
+    pickedCount
+  });
 });
 
 // ── Save & push to content script ─────────────────────────────
 function save() {
   chrome.storage.sync.set({ keywords, enabled, leadLimit, pickedCount }, () => {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      if (tabs[0]?.id) {
-        chrome.tabs.sendMessage(tabs[0].id, { type: 'SETTINGS_UPDATED' }).catch(() => {});
-      }
+    logPopup('Saved popup state to storage.', {
+      enabled,
+      keywordCount: keywords.length,
+      leadLimit: leadLimit || '∞',
+      pickedCount
     });
+    pushSettingsUpdate();
   });
 }
 
 // ── Toggle ─────────────────────────────────────────────────────
 toggle.addEventListener('change', () => {
   enabled = toggle.checked;
+  logPopup('Enable toggle changed.', { enabled });
   updateStatus();
   save();
 });
@@ -56,6 +148,7 @@ leadLimitInput.addEventListener('change', () => {
   const val = parseInt(leadLimitInput.value) || 0;
   leadLimit = val < 0 ? 0 : val;
   leadLimitInput.value = leadLimit || '';
+  logPopup('Lead limit changed.', { leadLimit: leadLimit || '∞' });
   updateProgress();
   save();
 });
@@ -64,6 +157,7 @@ leadLimitInput.addEventListener('change', () => {
 resetBtn.addEventListener('click', () => {
   pickedCount = 0;
   chrome.storage.sync.set({ pickedCount: 0 });
+  logPopup('Reset counter clicked.');
   // Also tell content script
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     if (tabs[0]?.id) {
@@ -85,12 +179,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'COUNT_UPDATED') {
     pickedCount = msg.pickedCount;
     leadLimit   = msg.leadLimit;
+    logPopup('COUNT_UPDATED received.', { pickedCount, leadLimit: leadLimit || '∞' });
     updateProgress();
   }
   if (msg.type === 'LIMIT_REACHED') {
     pickedCount = msg.pickedCount;
     enabled = false;
     toggle.checked = false;
+    warnPopup('LIMIT_REACHED received. Popup set to disabled.', { pickedCount });
     updateProgress();
     updateStatus();
   }
@@ -107,6 +203,11 @@ chrome.storage.onChanged.addListener((changes, area) => {
     enabled = changes.enabled.newValue === true;
     toggle.checked = enabled;
   }
+  logPopup('Storage change observed in popup.', {
+    pickedCount,
+    leadLimit: leadLimit || '∞',
+    enabled
+  });
   updateProgress();
   updateStatus();
 });
