@@ -2,12 +2,6 @@
 // IndiaMart BuyLead Auto-Picker — content.js (FINAL)
 // Page: seller.indiamart.com/messagecentre/buyleads/
 // ============================================================
-// TIMING PHILOSOPHY:
-//   Your code owns ~5ms of the cycle. The rest is IndiaMart's
-//   feed refresh (200–600ms). Every design decision here
-//   optimises for firing the click signal first, not confirming
-//   it arrived. Fire-and-trust beats wait-and-verify in a race.
-// ============================================================
 
 // ── State ────────────────────────────────────────────────
 let keywords        = [];
@@ -34,24 +28,46 @@ let shimmerBlockStartedAt = 0;
 let shimmerBlockConsecutive = 0;
 let ignoreShimmerUntil = 0;
 let lastSameTopLeadLogAt = 0;
+let currentWatchedLead = null; // { title, fingerprint }
 const recentlyClickedLeads = new Map(); // key -> timestamp(ms)
 let lastClickAt = 0;
+let storageReloadTimer = null;
+const pendingLeadQueue = []; // small FIFO of leads seen while processing
 
 // ── Constants ────────────────────────────────────────────
 const CONTACT_BUYER_RX = /contact\s*buyer/i;
-const POLL_MS          = 100; // how often the scanner tick runs
+const POLL_MS          = 250; // how often the scanner tick runs
 const SHIMMER_SETTLE_MS = 200;
 const SHIMMER_MAX_BLOCK_MS = 4000;
 const SHIMMER_FORCE_RESUME_STREAK = 25;
 const SHIMMER_BYPASS_AFTER_FORCE_MS = 1500;
 const CLICK_DEDUPE_TTL_MS = 3000;
 const CLICK_COOLDOWN_MS = 350;
-const SAME_TOP_LEAD_LOG_MS = 1000;
+const SAME_TOP_LEAD_LOG_MS = 250;
+const PENDING_QUEUE_MAX = 2;
 const DEBUG            = true;
 const HEARTBEAT_MS     = 3000;
+const METRICS_STORAGE_KEY = 'evalMetricsV1';
+
+const EVAL_SCENARIOS = {
+  DISABLED_OR_LIMIT: 'disabled_or_limit',
+  INVALID_CARD: 'invalid_card',
+  STALE_PROCESS: 'stale_process',
+  MISSING_PARENT: 'missing_parent',
+  MISSING_TITLE: 'missing_title',
+  DEDUPE_SKIP: 'dedupe_skip',
+  COOLDOWN_SKIP: 'cooldown_skip',
+  NO_MATCH: 'no_match',
+  CARD_DETACHED: 'card_detached',
+  MATCH_NO_BUTTON: 'match_no_button',
+  CLICKED: 'clicked'
+};
 
 // ── Card selectors (tried in order, first match wins) ────
 const CARD_SELECTORS = [
+  '[id^="BLCard"]',
+  '.BuyLdC_cont',
+  '[class*="BuyLdC_cont"]',
   '[class*="lstNw"]',
   'div.f1.lstNw',
   'div.bl_listing',
@@ -65,6 +81,9 @@ const FEED_SELECTORS = [
   'div.bl_grid',
   '[class*="bl_listing"]',
   '#buyleads-container',
+  '.BuyLead_Wrapper',
+  '.BuyLdC_wrap',
+  '.RelventLeads',
   '.messagecentre-right',
   'main',
   'section'
@@ -106,6 +125,132 @@ function logDebug(msg, meta) {
   else console.debug(`[BuyLead][${debugStamp()}] ${msg}`);
 }
 
+function enqueuePendingLead(fingerprint, title) {
+  if (!fingerprint) return;
+  if (pendingLeadQueue.some(item => item.fingerprint === fingerprint)) return;
+  while (pendingLeadQueue.length >= PENDING_QUEUE_MAX) pendingLeadQueue.shift();
+  pendingLeadQueue.push({ fingerprint, title, queuedAt: Date.now() });
+  logDebug('Queued pending lead', {
+    fingerprint,
+    title,
+    queuedCount: pendingLeadQueue.length
+  });
+}
+
+function findQueuedLeadCard(cards) {
+  if (!pendingLeadQueue.length) return null;
+  const target = pendingLeadQueue[0];
+  for (const card of cards) {
+    const title = getLeadTitle(card);
+    const fingerprint = getCardFingerprint(card, title);
+    if (fingerprint === target.fingerprint) {
+      pendingLeadQueue.shift();
+      return { card, title, fingerprint };
+    }
+  }
+  pendingLeadQueue.shift();
+  logDebug('Queued lead not found; dropped.', { fingerprint: target.fingerprint });
+  return null;
+}
+
+function createEmptyEvalMetrics() {
+  return {
+    version: 1,
+    startedAt: Date.now(),
+    lastUpdatedAt: 0,
+    total: {
+      attempts: 0,
+      clicked: 0,
+      totalProcessMs: 0,
+      totalClickMs: 0
+    },
+    scenarios: {}
+  };
+}
+
+let evalMetrics = createEmptyEvalMetrics();
+let evalMetricsPersistTimer = null;
+
+function ensureScenarioBucket(name) {
+  if (!evalMetrics.scenarios[name]) {
+    evalMetrics.scenarios[name] = {
+      attempts: 0,
+      clicked: 0,
+      totalProcessMs: 0,
+      totalClickMs: 0
+    };
+  }
+  return evalMetrics.scenarios[name];
+}
+
+function persistEvalMetrics() {
+  if (evalMetricsPersistTimer) return;
+  evalMetricsPersistTimer = setTimeout(() => {
+    evalMetricsPersistTimer = null;
+    chrome.storage.local.set({ [METRICS_STORAGE_KEY]: evalMetrics }, () => {
+      if (chrome.runtime.lastError) {
+        logWarn('Eval metrics persist failed.', chrome.runtime.lastError.message);
+      }
+    });
+  }, 250);
+}
+
+function recordEvalResult(scenario, startedAt, clicked, clickAt) {
+  const endAt = performance.now();
+  const processMs = Math.max(0, endAt - startedAt);
+  const clickMs = clicked && typeof clickAt === 'number' ? Math.max(0, clickAt - startedAt) : 0;
+
+  evalMetrics.total.attempts += 1;
+  evalMetrics.total.totalProcessMs += processMs;
+
+  if (clicked) {
+    evalMetrics.total.clicked += 1;
+    evalMetrics.total.totalClickMs += clickMs;
+  }
+
+  const bucket = ensureScenarioBucket(scenario);
+  bucket.attempts += 1;
+  bucket.totalProcessMs += processMs;
+  if (clicked) {
+    bucket.clicked += 1;
+    bucket.totalClickMs += clickMs;
+  }
+
+  evalMetrics.lastUpdatedAt = Date.now();
+  persistEvalMetrics();
+}
+
+function summarizeEvalMetrics(metrics) {
+  const total = metrics?.total || { attempts: 0, clicked: 0, totalProcessMs: 0, totalClickMs: 0 };
+  return {
+    attempts: total.attempts || 0,
+    clicked: total.clicked || 0,
+    avgProcessMs: total.attempts ? total.totalProcessMs / total.attempts : 0,
+    avgClickMs: total.clicked ? total.totalClickMs / total.clicked : 0
+  };
+}
+
+function loadEvalMetrics() {
+  chrome.storage.local.get([METRICS_STORAGE_KEY], (data) => {
+    if (chrome.runtime.lastError) {
+      logWarn('Eval metrics load failed.', chrome.runtime.lastError.message);
+      return;
+    }
+    if (data && data[METRICS_STORAGE_KEY]) {
+      evalMetrics = data[METRICS_STORAGE_KEY];
+    }
+  });
+}
+
+function resetEvalMetrics() {
+  evalMetrics = createEmptyEvalMetrics();
+  chrome.storage.local.set({ [METRICS_STORAGE_KEY]: evalMetrics }, () => {
+    if (chrome.runtime.lastError) {
+      logWarn('Eval metrics reset failed.', chrome.runtime.lastError.message);
+    }
+  });
+}
+
 function scannerSnapshot() {
   return {
     state: scannerState,
@@ -116,8 +261,30 @@ function scannerSnapshot() {
     dedupeCacheSize: recentlyClickedLeads.size,
     pickedCount,
     leadLimit,
-    tick: scanTickCount
+    tick: scanTickCount,
+    watchingLead: currentWatchedLead
   };
+}
+
+function updateWatchedLead(title, fingerprint) {
+  if (!title && !fingerprint) return;
+  const next = {
+    title: title || '(unknown title)',
+    fingerprint: fingerprint || ''
+  };
+  if (
+    currentWatchedLead &&
+    currentWatchedLead.title === next.title &&
+    currentWatchedLead.fingerprint === next.fingerprint
+  ) {
+    return;
+  }
+  currentWatchedLead = next;
+  logInfo('Watching lead', currentWatchedLead);
+}
+
+function clearWatchedLead() {
+  currentWatchedLead = null;
 }
 
 function pruneRecentlyClicked(now = Date.now()) {
@@ -138,6 +305,8 @@ function getCardStructureKey(card) {
 
 function getLeadKey(card) {
   const ofrId = card.querySelector('input[name="ofrid"]')?.value || card.getAttribute('data-id') || card.getAttribute('data-lead-id') || '';
+  const cardId = card.getAttribute('id') || '';
+  const position = card.getAttribute('position') || '';
   const offerDate = card.querySelector('input[name="offerdate"]')?.value || card.querySelector('input[name="ofrdate"]')?.value || '';
   const mcatId = card.querySelector('input[name="mcatid"]')?.value || card.querySelector('input[name="mcatidnew"]')?.value || '';
   const gridParam = card.querySelector('input[name="gridParam1"]')?.value || card.querySelector('input[id^="gridParam"]')?.value || '';
@@ -152,6 +321,7 @@ function getLeadKey(card) {
 
   // Prefer explicit lead id when available so same-title inquiries are treated independently.
   if (normalizeText(ofrId)) return `leadid:${normalizeText(ofrId)}`;
+  if (normalizeText(cardId)) return `leadid:${normalizeText(cardId)}`;
 
   // Fallback avoids title-only identity; combines multiple metadata fields.
   const parts = [
@@ -165,7 +335,8 @@ function getLeadKey(card) {
     normalizeText(buyerId),
     normalizeText(cat),
     normalizeText(productOrService),
-    normalizeText(href)
+    normalizeText(href),
+    normalizeText(position)
   ];
 
   const nonEmpty = parts.filter(Boolean).length;
@@ -353,7 +524,11 @@ function matchesKeywords(text) {
   if (!compiledKeywords.length) return false;
   const rx = compiledKeywords.find(r => r.test(text));
   if (rx) {
-    logInfo('Keyword matched', { title: text, matchedRegex: String(rx) });
+    logInfo('Keyword matched', {
+      title: text,
+      matchedRegex: String(rx),
+      keywordCount: keywords.length
+    });
     return true;
   }
   return false;
@@ -367,10 +542,14 @@ function getLeadTitle(card) {
   if (inp?.value) return inp.value.trim();
 
   const fallbacks = [
+    '.BuyLdC_m6',
+    '.BuyLdC_n6',
+    '.BuyLdC_ttl',
+    '.BuyLdC_title',
+    '[class*="BuyLdC"] [class*="title"]',
     '.bl_lsting_title',
     '[class*="Prd_Enq"] h2',
     '[class*="Prd_Enq"] h3',
-    'h2', 'h3',
     '.prod-name', '.product-name',
     '.bl-prod-name', '.lead-title'
   ];
@@ -408,6 +587,7 @@ function getCardFingerprint(card, title) {
   const mcatId = card.querySelector('input[name="mcatid"]')?.value || card.querySelector('input[name="mcatidnew"]')?.value || '';
   const gridParam = card.querySelector('input[name="gridParam1"]')?.value || card.querySelector('input[id^="gridParam"]')?.value || '';
   const href = card.querySelector('a[href]')?.getAttribute('href') || '';
+  const position = card.getAttribute('position') || '';
   const cardIndex = card.parentElement
     ? Array.prototype.indexOf.call(card.parentElement.children, card)
     : -1;
@@ -426,6 +606,7 @@ function getCardFingerprint(card, title) {
     normalizeText(country),
     normalizeText(mcatId),
     normalizeText(href),
+    normalizeText(position),
     normalizeText(title),
     cardIndex
   ].join('|');
@@ -620,16 +801,23 @@ async function clickAcceptButton(card, ctx, parentRef) {
 
 // ── Process top card ──────────────────────────────────────
 async function processCard(card, ctx) {
-  if (!isEnabled || !card || card.nodeType !== 1 || limitReached()) return false;
-  if (!card.isConnected || !isProcessCurrent(ctx)) return false;
+  const startedAt = performance.now();
+  const finish = (scenario, clicked, clickAt) => {
+    recordEvalResult(scenario, startedAt, clicked, clickAt);
+    return clicked;
+  };
+
+  if (!isEnabled || limitReached()) return finish(EVAL_SCENARIOS.DISABLED_OR_LIMIT, false);
+  if (!card || card.nodeType !== 1) return finish(EVAL_SCENARIOS.INVALID_CARD, false);
+  if (!card.isConnected || !isProcessCurrent(ctx)) return finish(EVAL_SCENARIOS.STALE_PROCESS, false);
 
   const parentRef = card.parentElement;
-  if (!parentRef) return false;
+  if (!parentRef) return finish(EVAL_SCENARIOS.MISSING_PARENT, false);
 
   const title = getLeadTitle(card);
   if (!title || title.length < 4) {
     logWarn('Card skipped — could not extract title.', { className: card.className });
-    return false;
+    return finish(EVAL_SCENARIOS.MISSING_TITLE, false);
   }
 
   logDebug('Evaluating top card title', { title });
@@ -639,32 +827,39 @@ async function processCard(card, ctx) {
   const leadKey = getLeadKey(card);
   if (wasRecentlyClicked(leadKey)) {
     logWarn('Skipping lead due to dedupe TTL (recently clicked).', { leadKey });
-    return false;
+    return finish(EVAL_SCENARIOS.DEDUPE_SKIP, false);
   }
 
   if (globalClickCoolingDown(now)) {
     logDebug('Skipping lead due to global click cooldown.', { cooldownMs: CLICK_COOLDOWN_MS });
-    return false;
+    return finish(EVAL_SCENARIOS.COOLDOWN_SKIP, false);
   }
 
-  if (!matchesKeywords(title) || !isProcessCurrent(ctx)) return false;
+  if (!isProcessCurrent(ctx)) return finish(EVAL_SCENARIOS.STALE_PROCESS, false);
+  if (!matchesKeywords(title)) return finish(EVAL_SCENARIOS.NO_MATCH, false);
 
-  if (!card.isConnected || card.parentElement !== parentRef || !isProcessCurrent(ctx)) {
+  if (!card.isConnected || card.parentElement !== parentRef) {
     logWarn('Card detached before click.');
-    return false;
+    return finish(EVAL_SCENARIOS.CARD_DETACHED, false);
   }
+  if (!isProcessCurrent(ctx)) return finish(EVAL_SCENARIOS.STALE_PROCESS, false);
 
   const clicked = await clickAcceptButton(card, ctx, parentRef);
 
   if (clicked) {
+    const clickAt = performance.now();
     lastClickAt = Date.now();
     markLeadClicked(leadKey, lastClickAt);
     await incrementPicked();
+    notifyMatch(title, true);
     // Keep lastTopCardId unchanged to avoid rapid re-click loops on the same top card.
+    return finish(EVAL_SCENARIOS.CLICKED, true, clickAt);
   }
 
-  notifyMatch(title, clicked);
-  return clicked;
+  notifyMatch(title, false);
+  if (!isProcessCurrent(ctx)) return finish(EVAL_SCENARIOS.STALE_PROCESS, false);
+  if (!card.isConnected || card.parentElement !== parentRef) return finish(EVAL_SCENARIOS.CARD_DETACHED, false);
+  return finish(EVAL_SCENARIOS.MATCH_NO_BUTTON, false);
 }
 
 // ── Card discovery ────────────────────────────────────────
@@ -675,7 +870,8 @@ function findLeadCards(root = document) {
     // Accept if it has the canonical title input, a known title class, or enough text
     return (
       el.querySelector('input[name="ofrtitle"]') ||
-      el.querySelector('.prod-name, .bl_lsting_title') ||
+      el.querySelector('.prod-name, .bl_lsting_title, .BuyLdC_n6, .BuyLdC_ttl, .BuyLdC_title') ||
+      el.querySelector('[class*="BuyLdC"] [class*="title"]') ||
       normalizeText(el.textContent).length > 20
     );
   };
@@ -785,19 +981,58 @@ function startScanner() {
     }
 
     const cards = findLeadCards();
-    if (!cards.length) return;
+    if (!cards.length) {
+      clearWatchedLead();
+      return;
+    }
+
+    if (!activeProcess && !isProcessingCard) {
+      const queued = findQueuedLeadCard(cards);
+      if (queued) {
+        scannerState      = 'PROCESSING';
+        lastTopCardId    = queued.fingerprint;
+        isProcessingCard = true;
+        activeProcess    = { token: ++processSeq, fingerprint: queued.fingerprint, cancelled: false };
+        const processCtx = activeProcess;
+        logInfo('Processing queued lead', {
+          token: processCtx.token,
+          title: queued.title,
+          fingerprint: queued.fingerprint
+        });
+
+        processCard(queued.card, processCtx).finally(() => {
+          if (activeProcess && activeProcess.token === processCtx.token) {
+            activeProcess = null;
+            isProcessingCard = false;
+            scannerState = 'READY';
+            logDebug('Queued process completed; scanner returned to READY.', { token: processCtx.token });
+          }
+        });
+        return;
+      }
+    }
 
     const topCard  = cards[0];
     const title    = getLeadTitle(topCard);
     const currentId = getCardFingerprint(topCard, title);
+    updateWatchedLead(title, currentId);
+    logDebug('Tick check', {
+      fingerprint: currentId,
+      title,
+      sameAsLast: currentId === lastTopCardId,
+      processing: !!activeProcess || isProcessingCard,
+      queuedCount: pendingLeadQueue.length,
+      state: scannerState
+    });
 
-    // If processing old top-card and the top changed, cancel stale process.
+    // If processing old top-card and the top changed, wait for current process to finish.
     if (activeProcess && currentId !== activeProcess.fingerprint) {
-      cancelActiveProcess();
-      logDebug('Top card changed while processing; stale process cancelled.', {
-        previous: activeProcess?.fingerprint,
+      enqueuePendingLead(currentId, title);
+      logDebug('Top card changed while processing; queued for later.', {
+        processing: activeProcess.fingerprint,
         next: currentId
       });
+      return;
     }
 
     // Log once per second when the top lead is unchanged.
@@ -849,6 +1084,7 @@ function stopScanner() {
   scannerState     = 'IDLE';
   shimmerBlockConsecutive = 0;
   ignoreShimmerUntil = 0;
+  clearWatchedLead();
   logInfo('Scanner stopped.', scannerSnapshot());
 }
 
@@ -862,6 +1098,15 @@ function reloadSettingsAndScanner(cb) {
   });
 }
 
+function scheduleSettingsReload(reason) {
+  if (storageReloadTimer) clearTimeout(storageReloadTimer);
+  storageReloadTimer = setTimeout(() => {
+    storageReloadTimer = null;
+    logInfo('Storage change detected — reloading settings.', { reason });
+    reloadSettingsAndScanner();
+  }, 200);
+}
+
 // ── Message listener ──────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (!msg?.type) return;
@@ -870,6 +1115,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     logInfo('Received SETTINGS_UPDATED message. Reloading scanner settings.');
     reloadSettingsAndScanner((ok) => sendResponse({ ok }));
     return true; // keep channel open for async sendResponse
+  }
+
+  if (msg.type === 'GET_EVAL_METRICS') {
+    sendResponse({ ok: true, metrics: evalMetrics, summary: summarizeEvalMetrics(evalMetrics) });
+    return;
+  }
+
+  if (msg.type === 'RESET_EVAL_METRICS') {
+    resetEvalMetrics();
+    sendResponse({ ok: true });
+    return;
   }
 
   if (msg.type === 'GET_STATUS') {
@@ -885,7 +1141,21 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 });
 
+// Keep content script settings in sync even if popup message misses.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'sync') return;
+  if (
+    changes.keywords ||
+    changes.enabled ||
+    changes.leadLimit ||
+    changes.pickedCount
+  ) {
+    scheduleSettingsReload('sync-storage-change');
+  }
+});
+
 // ── Init ──────────────────────────────────────────────────
+loadEvalMetrics();
 loadSettings(() => {
   if (isEnabled && !limitReached()) {
     logInfo('Init: extension is active and watching.');

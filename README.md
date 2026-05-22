@@ -23,6 +23,7 @@ on any lead that contains your keywords.
 4. Add your **keywords** (e.g. "steel", "pipe fittings", "flanges")
 5. Toggle **Auto-Accept Mode ON**
 6. Keep the tab open — it will auto-click "Contact Buyer Now" on every matching lead
+7. Open **Eval Metrics** in the popup to see average click/process times and scenario breakdowns
 
 ---
 
@@ -36,15 +37,9 @@ IndiaMart updates their DOM occasionally. If auto-click stops working:
 4. Open `content.js` and add the class to the `cardSelectors` array
 
 ### Accept Button Label
-The extension tries multiple button labels:
-- "Contact Buyer Now"
-- "Accept"
-- "Pick Lead"
-- "Consume"
-- "Get Contact"
-- "View Contact"
-
-If IndiaMart uses a different label, add it to `acceptPatterns` in `content.js`.
+The extension searches for a clickable CTA that matches "Contact Buyer" (text, title, aria-label,
+or common CTA class/onclick patterns). If IndiaMart changes the CTA label, update the
+`CONTACT_BUYER_RX` matcher in `content.js`.
 
 ### Single Page App (SPA) Handling
 IndiaMart is a React SPA. The extension auto-detects URL changes
@@ -72,5 +67,5 @@ and re-scans every time you navigate to a new section.
 
 **Button not found?**
 - Inspect the accept button and note its exact text
-- Add that text as a pattern in `content.js` → `acceptPatterns`
+- Update the `CONTACT_BUYER_RX` matcher in `content.js` if the CTA label changed
 # indiamart-extension

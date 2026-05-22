@@ -12,6 +12,13 @@ const countLabel    = document.getElementById('countLabel');
 const progressFill  = document.getElementById('progressFill');
 const resetBtn      = document.getElementById('resetBtn');
 const limitBanner   = document.getElementById('limitBanner');
+const evalAvgClick  = document.getElementById('evalAvgClick');
+const evalAvgProcess= document.getElementById('evalAvgProcess');
+const evalCounts    = document.getElementById('evalCounts');
+const evalRefreshBtn= document.getElementById('evalRefreshBtn');
+const evalResetBtn  = document.getElementById('evalResetBtn');
+const evalStatus    = document.getElementById('evalStatus');
+const evalScenarioList = document.getElementById('evalScenarioList');
 
 let keywords    = [];
 let enabled     = false;
@@ -101,6 +108,103 @@ async function pushSettingsUpdate(retries = 3, delayMs = 250) {
   return false;
 }
 
+function formatMs(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '—';
+  if (ms >= 1000) return `${(ms / 1000).toFixed(2)} s`;
+  return `${Math.round(ms)} ms`;
+}
+
+function clearEvalMetricsView(message) {
+  evalAvgClick.textContent = '—';
+  evalAvgProcess.textContent = '—';
+  evalCounts.textContent = '—';
+  evalScenarioList.innerHTML = '';
+  evalStatus.textContent = message || 'No eval data yet.';
+}
+
+function renderEvalScenarioList(scenarios) {
+  evalScenarioList.innerHTML = '';
+  const entries = Object.entries(scenarios || {});
+  if (!entries.length) return;
+
+  entries.sort((a, b) => (b[1].attempts || 0) - (a[1].attempts || 0));
+
+  for (const [name, bucket] of entries) {
+    const avgProcess = bucket.attempts ? bucket.totalProcessMs / bucket.attempts : 0;
+    const avgClick = bucket.clicked ? bucket.totalClickMs / bucket.clicked : 0;
+    const detail = `${bucket.attempts || 0} · ${formatMs(avgProcess)} · ${bucket.clicked ? formatMs(avgClick) : '—'}`;
+
+    const row = document.createElement('div');
+    row.className = 'eval-scenario';
+    row.innerHTML = `<span class="name">${name}</span><span>${detail}</span>`;
+    evalScenarioList.appendChild(row);
+  }
+}
+
+function renderEvalMetrics(metrics, summary) {
+  if (!metrics?.total || !metrics.total.attempts) {
+    clearEvalMetricsView('No eval data yet.');
+    return;
+  }
+
+  evalAvgClick.textContent = formatMs(summary?.avgClickMs || 0);
+  evalAvgProcess.textContent = formatMs(summary?.avgProcessMs || 0);
+  evalCounts.textContent = `${summary?.attempts || 0} / ${summary?.clicked || 0}`;
+  evalStatus.textContent = 'Updated';
+  renderEvalScenarioList(metrics.scenarios);
+}
+
+async function sendEvalMessage(msg, retries = 2, delayMs = 200) {
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  const tab = tabs[0];
+
+  if (!tab?.id) return { ok: false, error: 'no-active-tab' };
+  if (!isEligibleSellerTab(tab)) return { ok: false, error: 'not-seller-tab' };
+
+  const tabId = tab.id;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await chrome.tabs.sendMessage(tabId, msg);
+      if (res?.ok) return res;
+      warnPopup('Eval message did not return ok. Retrying if attempts remain.', { attempt, tabId, res });
+    } catch (err) {
+      const msgText = normalizeErrorMessage(err);
+      const meta = { attempt, tabId, error: msgText };
+      if (isExpectedTransientSendError(msgText)) {
+        logPopup('Eval message deferred due to transient tab/content state.', meta);
+      } else {
+        warnPopup('Eval message send failed.', meta);
+      }
+    }
+    if (attempt < retries) await sleep(delayMs);
+  }
+  return { ok: false, error: 'no-response' };
+}
+
+async function refreshEvalMetrics() {
+  evalStatus.textContent = 'Loading...';
+  const res = await sendEvalMessage({ type: 'GET_EVAL_METRICS' });
+  if (!res?.ok) {
+    clearEvalMetricsView(
+      res?.error === 'not-seller-tab'
+        ? 'Open seller.indiamart.com to load metrics.'
+        : 'Unable to load metrics.'
+    );
+    return;
+  }
+  renderEvalMetrics(res.metrics, res.summary);
+}
+
+async function resetEvalMetricsUI() {
+  evalStatus.textContent = 'Resetting...';
+  const res = await sendEvalMessage({ type: 'RESET_EVAL_METRICS' });
+  if (!res?.ok) {
+    clearEvalMetricsView('Unable to reset metrics.');
+    return;
+  }
+  await refreshEvalMetrics();
+}
+
 // ── Load from storage ─────────────────────────────────────────
 chrome.storage.sync.get(['keywords', 'enabled', 'leadLimit', 'pickedCount'], (data) => {
   keywords    = data.keywords    || [];
@@ -114,6 +218,7 @@ chrome.storage.sync.get(['keywords', 'enabled', 'leadLimit', 'pickedCount'], (da
   renderKeywords();
   updateProgress();
   updateStatus();
+  refreshEvalMetrics();
   logPopup('Popup initialized from storage.', {
     enabled,
     keywordCount: keywords.length,
@@ -172,6 +277,14 @@ resetBtn.addEventListener('click', () => {
   }
   updateProgress();
   updateStatus();
+});
+
+evalRefreshBtn.addEventListener('click', () => {
+  refreshEvalMetrics();
+});
+
+evalResetBtn.addEventListener('click', () => {
+  resetEvalMetricsUI();
 });
 
 // ── Listen for live count updates from content script ─────────

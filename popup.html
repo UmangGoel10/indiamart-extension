@@ -187,6 +187,42 @@
     }
     .limit-banner.show { display: block; }
 
+    /* Eval metrics */
+    .eval-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      color: #495057;
+      margin-top: 4px;
+    }
+    .eval-row span.label { color: #6c757d; }
+    .eval-actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .eval-actions .reset-btn { margin-top: 0; flex: 1; }
+    .eval-status {
+      font-size: 11px;
+      color: #6c757d;
+      margin-top: 6px;
+    }
+    .eval-scenarios {
+      margin-top: 6px;
+      border-top: 1px dashed #e9ecef;
+      padding-top: 6px;
+      max-height: 90px;
+      overflow: auto;
+    }
+    .eval-scenario {
+      display: flex;
+      justify-content: space-between;
+      font-size: 11px;
+      margin-top: 2px;
+      color: #495057;
+    }
+
     .footer {
       padding: 6px 16px 12px;
       font-size: 10px; color: #adb5bd; text-align: center;
@@ -254,6 +290,20 @@
     <div class="keyword-list" id="keywordList">
       <span class="empty-msg" id="emptyMsg">No keywords added yet</span>
     </div>
+  </div>
+
+  <!-- Eval metrics -->
+  <div class="card">
+    <div class="section-title">🧪 Eval Metrics</div>
+    <div class="eval-row"><span class="label">Avg click time</span><span id="evalAvgClick">—</span></div>
+    <div class="eval-row"><span class="label">Avg process time</span><span id="evalAvgProcess">—</span></div>
+    <div class="eval-row"><span class="label">Attempts / Clicked</span><span id="evalCounts">—</span></div>
+    <div class="eval-actions">
+      <button class="reset-btn" id="evalRefreshBtn">↻ Refresh</button>
+      <button class="reset-btn" id="evalResetBtn">Reset evals</button>
+    </div>
+    <div class="eval-scenarios" id="evalScenarioList"></div>
+    <div class="eval-status" id="evalStatus">Loading...</div>
   </div>
 
   <!-- Status -->
