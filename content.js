@@ -546,10 +546,15 @@ function getLeadTitle(card) {
     '.BuyLdC_n6',
     '.BuyLdC_ttl',
     '.BuyLdC_title',
+    '.SLC_f18.SLC_wb',
+    '.SLC_f18',
     '[class*="BuyLdC"] [class*="title"]',
     '.bl_lsting_title',
     '[class*="Prd_Enq"] h2',
     '[class*="Prd_Enq"] h3',
+    'h1',
+    'h2',
+    'h3',
     '.prod-name', '.product-name',
     '.bl-prod-name', '.lead-title'
   ];
@@ -871,6 +876,7 @@ function findLeadCards(root = document) {
     return (
       el.querySelector('input[name="ofrtitle"]') ||
       el.querySelector('.prod-name, .bl_lsting_title, .BuyLdC_n6, .BuyLdC_ttl, .BuyLdC_title') ||
+      el.querySelector('.SLC_f18.SLC_wb, .SLC_f18') ||
       el.querySelector('[class*="BuyLdC"] [class*="title"]') ||
       normalizeText(el.textContent).length > 20
     );
